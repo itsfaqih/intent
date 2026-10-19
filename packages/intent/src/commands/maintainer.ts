@@ -2,6 +2,7 @@ import { appendFileSync } from 'node:fs'
 import { dirname, relative, resolve } from 'node:path'
 import { isCI } from 'std-env'
 import { resolveProjectContext } from '../core/project-context.js'
+import { createIntentFsCache } from '../discovery/fs-cache.js'
 import { fail } from '../shared/cli-error.js'
 import {
   planSetupRecords,
@@ -20,14 +21,11 @@ import {
 } from '../maintainer/distribution.js'
 import { planSetupGithubActions } from '../setup/index.js'
 import { detectIntentCommandPackageManager } from '../shared/command-runner.js'
-import { describeSkillExamples } from '../validate/blocks.js'
 import { getMetaDir } from './support.js'
 import {
   buildMaintainerGuidanceBlock,
   planIntentSkillsBlock,
 } from './install/guidance.js'
-import { runReviewCommand } from './review.js'
-import { runValidateCommand } from './validate.js'
 import type { DistributionOptions } from '../maintainer/distribution.js'
 import type { ReviewPrompts } from '../review/interactive.js'
 
@@ -325,6 +323,7 @@ export async function runMaintainerCommand(
       await runInteractiveReview(process.cwd(), options.base, prompts)
       return
     }
+    const { runReviewCommand } = await import('./review.js')
     runReviewCommand(undefined, options)
     return
   }
@@ -332,13 +331,16 @@ export async function runMaintainerCommand(
   if (['setup', 'add', 'remove', 'sync'].includes(action)) {
     await withMaintainerLock(project.root, () => {
       if (action === 'setup') {
-        const created = planSetupRecords(project)
-        const existing = findExistingSkills(project, created)
+        const fsCache = createIntentFsCache()
+        const checked = new Set<string>()
+        const created = planSetupRecords(project, fsCache, checked)
+        const existing = findExistingSkills(project, created, fsCache, checked)
         const candidates = existing.filter((skill) => !skill.problems.length)
         const registered = planAddSkills(
           project,
           candidates.map((skill) => ({
             name: skill.name,
+            frontmatter: skill.frontmatter,
             options: {
               package: skill.package || undefined,
               path: skill.path,
@@ -358,6 +360,8 @@ export async function runMaintainerCommand(
                 : `Set a non-empty domain for ${candidate.name} in ${project.artifacts}/domain_map.yaml, then run intent maintainer setup again.`,
             )
           },
+          fsCache,
+          checked,
         )
         const distributionChange = planDistributionChoice(
           project,
@@ -468,6 +472,7 @@ export async function runMaintainerCommand(
   const validatedExamples = new Map<string, string>()
   let validation: unknown
   if (action === 'check') {
+    const { runValidateCommand } = await import('./validate.js')
     // Include default workspace skills and any custom registered roots. Their errors land in
     // one report and one summary section, and the failure is rethrown after
     // the check summary below so the two sections keep their order.
@@ -488,7 +493,9 @@ export async function runMaintainerCommand(
       ? validatedExamples
       : options.json
         ? new Map<string, string>()
-        : await describeSkillExamples(
+        : await (
+            await import('../validate/blocks.js')
+          ).describeSkillExamples(
             project.root,
             review.items
               .filter((item) => item.kind === 'skill' && !item.problems.length)

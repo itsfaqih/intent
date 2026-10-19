@@ -1,4 +1,6 @@
+import { execFileSync } from 'node:child_process'
 import {
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -11,7 +13,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join, relative, resolve } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { main } from '../src/cli.js'
 import {
@@ -29,6 +31,7 @@ vi.mock('node:fs', async (importOriginal) => {
   const fs = await importOriginal<typeof NodeFs>()
   return {
     ...fs,
+    existsSync: vi.fn(fs.existsSync),
     readFileSync: vi.fn(fs.readFileSync),
     readdirSync: vi.fn(fs.readdirSync),
     lstatSync: vi.fn(fs.lstatSync),
@@ -37,7 +40,11 @@ vi.mock('node:fs', async (importOriginal) => {
 
 vi.mock('node:path', async (importOriginal) => {
   const path = await importOriginal<typeof NodePath>()
-  return { ...path, resolve: vi.fn(path.resolve) }
+  return {
+    ...path,
+    relative: vi.fn(path.relative),
+    resolve: vi.fn(path.resolve),
+  }
 })
 
 let root: string
@@ -90,10 +97,39 @@ describe('command work budgets', () => {
     expect(resolveIntentSkill('example#core', { cwd: root }).skillName).toBe(
       'core',
     )
+    expect(
+      vi
+        .mocked(existsSync)
+        .mock.calls.filter(
+          ([path]) => path === join(root, 'node_modules', 'example'),
+        ),
+    ).toHaveLength(0)
     expect(loadIntentSkill('example#core', { cwd: root }).content).toContain(
       'Guide.',
     )
     expect(metadataRead).not.toHaveBeenCalled()
+  })
+
+  it('skips lstat on node_modules packages without a skills directory during list', () => {
+    write(
+      join(root, 'package.json'),
+      JSON.stringify({
+        name: 'consumer',
+        dependencies: { example: '1.0.0', plain: '1.0.0' },
+      }),
+    )
+    writePackage(join(root, 'node_modules', 'example'), 'example')
+    const plainDir = join(root, 'node_modules', 'plain')
+    write(
+      join(plainDir, 'package.json'),
+      JSON.stringify({ name: 'plain', version: '1.0.0' }),
+    )
+    vi.clearAllMocks()
+
+    expect(listIntentSkills({ cwd: root }).skills).toHaveLength(1)
+    expect(
+      vi.mocked(lstatSync).mock.calls.filter(([path]) => path === plainDir),
+    ).toHaveLength(0)
   })
 
   it('indexes each skill path once when matching many artifact entries by name', async () => {
@@ -312,6 +348,11 @@ describe('command work budgets', () => {
       expect(
         vi
           .mocked(readFileSync)
+          .mock.calls.filter(([path]) => path === join(root, 'package.json')),
+      ).toHaveLength(1)
+      expect(
+        vi
+          .mocked(readFileSync)
           .mock.calls.filter(
             ([path]) => path === join(root, 'skills', 'core', 'SKILL.md'),
           ),
@@ -344,6 +385,18 @@ describe('command work budgets', () => {
       signals: [],
     })
     expect(reports[0].skills).toHaveLength(1)
+    expect(
+      vi
+        .mocked(readFileSync)
+        .mock.calls.filter(([path]) => path === join(root, 'package.json')),
+    ).toHaveLength(1)
+    expect(
+      vi
+        .mocked(readFileSync)
+        .mock.calls.filter(
+          ([path]) => path === join(root, 'pnpm-workspace.yaml'),
+        ),
+    ).toHaveLength(1)
     expect(
       vi
         .mocked(readFileSync)
@@ -386,6 +439,23 @@ describe('command work budgets', () => {
     expect(
       vi
         .mocked(readFileSync)
+        .mock.calls.filter(
+          ([path]) => path === join(root, 'pnpm-workspace.yaml'),
+        ),
+    ).toHaveLength(1)
+    expect(
+      vi
+        .mocked(readFileSync)
+        .mock.calls.filter(([path]) => path === join(root, 'package.json')),
+    ).toHaveLength(1)
+    expect(
+      vi
+        .mocked(readdirSync)
+        .mock.calls.filter(([path]) => path === join(root, 'packages')),
+    ).toHaveLength(1)
+    expect(
+      vi
+        .mocked(readFileSync)
         .mock.calls.filter(([path]) => path === artifactPath),
     ).toHaveLength(1)
     for (const dir of packageDirs) {
@@ -399,6 +469,11 @@ describe('command work budgets', () => {
           .mocked(readdirSync)
           .mock.calls.filter(([path]) => path === join(dir, 'skills')),
       ).toHaveLength(1)
+      expect(
+        vi
+          .mocked(relative)
+          .mock.calls.filter(([from, to]) => from === root && to === dir),
+      ).toHaveLength(1)
     }
     const reports = JSON.parse(
       vi.mocked(console.log).mock.calls.at(-1)![0] as string,
@@ -409,5 +484,45 @@ describe('command work budgets', () => {
         (report: { signals: Array<unknown> }) => report.signals.length === 0,
       ),
     ).toBe(true)
+  })
+
+  it('reads each existing skill frontmatter and shared directory once during maintainer setup', async () => {
+    execFileSync('git', ['-c', 'core.fsmonitor=false', 'init', '-q'], {
+      cwd: root,
+    })
+    write(
+      join(root, 'package.json'),
+      JSON.stringify({ name: '@bench/library', version: '1.0.0' }),
+    )
+    write(
+      join(root, '.github', 'workflows', 'check-skills.yml'),
+      '# Existing repository workflow\n',
+    )
+    const names = ['alpha', 'beta', 'gamma']
+    for (const name of names) {
+      write(
+        join(root, 'skills', name, 'SKILL.md'),
+        `---\nname: ${name}\ndescription: Use for ${name}.\nsources:\n  - package.json\n---\nGuidance.\n`,
+      )
+    }
+    vi.clearAllMocks()
+    const frontmatterRead = vi.spyOn(nodeReadFs, 'readSync')
+
+    expect(await main(['maintainer', 'setup'])).toBe(0)
+    expect(frontmatterRead).toHaveBeenCalledTimes(names.length)
+    for (const name of names) {
+      expect(
+        vi
+          .mocked(lstatSync)
+          .mock.calls.filter(([path]) => path === join(root, 'skills', name)),
+      ).toHaveLength(1)
+      expect(
+        vi
+          .mocked(lstatSync)
+          .mock.calls.filter(
+            ([path]) => path === join(root, 'skills', name, 'SKILL.md'),
+          ),
+      ).toHaveLength(1)
+    }
   })
 })

@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs'
+import { realpathSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { toPosixPath } from '../shared/utils.js'
 import { formatIntentCommand } from '../shared/command-runner.js'
@@ -50,12 +50,21 @@ export function rewriteSkillLoadPaths({
   projectRoot: string
   skills: Array<SkillEntry>
 }): void {
-  const hasStableSymlink =
-    packageName !== '' &&
-    existsSync(join(projectRoot, 'node_modules', packageName))
+  const topLevelPackageRoot =
+    packageName !== '' ? join(projectRoot, 'node_modules', packageName) : ''
+  let matchesTopLevelEntry: boolean
+  try {
+    matchesTopLevelEntry =
+      topLevelPackageRoot !== '' &&
+      (packageRoot === topLevelPackageRoot ||
+        realpathSync.native(topLevelPackageRoot) ===
+          realpathSync.native(packageRoot))
+  } catch {
+    matchesTopLevelEntry = false
+  }
 
   for (const skill of skills) {
-    if (hasStableSymlink) {
+    if (matchesTopLevelEntry) {
       const relFromPackage = toPosixPath(relative(packageRoot, skill.path))
       skill.path = `node_modules/${packageName}/${relFromPackage}`
     } else {
